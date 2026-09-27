@@ -1,0 +1,67 @@
+name: Lint Workflows
+
+on:
+  pull_request:
+    branches:
+      - 'main'
+    paths:
+      - '.github/workflows/**.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.sha }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  # Runs the actionlint GitHub Action workflow file linter.
+  #
+  # See https://github.com/rhysd/actionlint.
+  #
+  # This helps guard against common mistakes including strong type checking for expressions (${{ }}), security checks,
+  # `run:` script checking, glob syntax validation, and more.
+  actionlint:
+    name: Run actionlint
+    runs-on: ubuntu-24.04
+    if: ${{ github.event_name != 'pull_request' || ! github.event.pull_request.draft }}
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run actionlint
+        uses: docker://rhysd/actionlint@sha256:5457037ba91acd225478edac3d4b32e45cf6c10291e0dabbfd2491c63129afe1 # v1.7.11
+        with:
+          args: "-color -verbose"
+
+  # Runs the Zizmor GitHub Action workflow file linter.
+  #
+  # See https://github.com/zizmorcore/zizmor
+  #
+  # This helps guard against supply chain attacks, unpinned dependencies, excessive permissions,
+  # dangerous triggers, credential leaks, and sophisticated security vulnerabilities.
+  zizmor:
+    name: Zizmor
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+
+      - name: Run zizmor
+        run: uvx zizmor@1.24.1 --persona=regular --color=always --strict-collection .
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

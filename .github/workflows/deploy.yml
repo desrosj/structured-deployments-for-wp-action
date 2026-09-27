@@ -1,0 +1,356 @@
+name: Structured Deployment
+
+# Reusable workflow that deploys a WordPress site managed by
+# desrosj/structured-deployments-for-wp:
+#
+# 1. rsyncs every plugin and theme the manifest declares with
+#    `"source": "monorepo"` from the caller's `wp-content/` to the server,
+# 2. installs the `structured-deployments` plugin at the version the manifest
+#    pins, and
+# 3. runs `wp structured-deployments reconcile` against the manifest.
+#
+# Everything site-specific is read from the caller's deploy manifest, so the
+# manifest stays the single source of truth:
+#
+# - Which plugin and theme folders are rsynced: every `monorepo` entry in the
+#   merged `shared` + target-env `plugins` and `themes` maps.
+# - Which plugin is bootstrap-activated alongside `structured-deployments`:
+#   the manifest's top-level `site_plugin`, when set.
+# - Which secrets are forwarded to the reconciler: every `${VAR}` the manifest
+#   interpolates, plus every `token_env` it names.
+#
+# See README.md for how to call it, and the secrets it expects.
+
+on:
+  workflow_call:
+    inputs:
+      target-env:
+        description: >-
+          Manifest section to deploy (for example `staging` or `production`).
+          Passed to the reconciler as `--env`.
+        required: true
+        type: string
+      environment:
+        description: >-
+          GitHub Environment the deploy jobs run in. The deploy secrets are
+          read from this environment.
+        required: true
+        type: string
+      manifest:
+        description: Path to the deploy manifest, relative to the repository root.
+        required: false
+        type: string
+        default: 'deploy-manifest.json'
+      distignore:
+        description: Path to the rsync exclude file, relative to the repository root.
+        required: false
+        type: string
+        default: '.distignore'
+
+# The deploy secrets are GitHub Environment secrets. A caller cannot pass those
+# through `on.workflow_call.secrets` (its job has no `environment`), so they
+# are not declared here. Each job below that names `environment` reads them
+# from that environment directly.
+
+permissions: {}
+
+jobs:
+  # Reads the manifest and works out what the other jobs need to do. This job
+  # has no environment and touches no secrets.
+  plan:
+    name: Plan deploy to ${{ inputs.target-env }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      code: ${{ steps.plan.outputs.code }}
+      site-plugin: ${{ steps.plan.outputs.site-plugin }}
+      env-names: ${{ steps.plan.outputs.env-names }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read the manifest
+        id: plan
+        env:
+          MANIFEST: ${{ inputs.manifest }}
+          TARGET_ENV: ${{ inputs.target-env }}
+        run: |
+          if [ ! -f "$MANIFEST" ]; then
+            echo "::error::Deploy manifest $MANIFEST not found."
+            exit 1
+          fi
+          if ! jq -e --arg env "$TARGET_ENV" 'has($env) or has("shared")' "$MANIFEST" > /dev/null; then
+            echo "::error::$MANIFEST has neither a \"shared\" nor a \"$TARGET_ENV\" section."
+            exit 1
+          fi
+
+          # Merge `shared` with the target env the way the reconciler does: env
+          # entries replace shared ones by key, and a bare `false` drops the key.
+          # Keep only the `monorepo` entries; those are what rsync delivers.
+          CODE=$(jq -c --arg env "$TARGET_ENV" '
+            def merged($section): ((.shared[$section] // {}) + (.[$env][$section] // {}));
+            def monorepo($section; $kind): merged($section)
+              | to_entries
+              | map(select((.value | type) == "object" and .value.source == "monorepo"))
+              | map({ type: $kind, slug: .key });
+            monorepo("plugins"; "plugin") + monorepo("themes"; "theme")
+          ' "$MANIFEST")
+
+          # Slugs are spliced into rsync destinations and remote wp-cli commands,
+          # so hold them to the same [a-z0-9-] shape the reconciler enforces.
+          while IFS=$'\t' read -r TYPE SLUG; do
+            [ -z "$SLUG" ] && continue
+            if ! [[ "$SLUG" =~ ^[a-z0-9-]+$ ]]; then
+              echo "::error::Invalid $TYPE slug \"$SLUG\" in $MANIFEST; slugs must match [a-z0-9-]."
+              exit 1
+            fi
+            if [ ! -d "wp-content/${TYPE}s/$SLUG" ]; then
+              echo "::error::$MANIFEST declares the $TYPE \"$SLUG\" as monorepo, but wp-content/${TYPE}s/$SLUG does not exist."
+              exit 1
+            fi
+          done < <(jq -r '.[] | [.type, .slug] | @tsv' <<< "$CODE")
+
+          SITE_PLUGIN=$(jq -r '.site_plugin // empty' "$MANIFEST")
+          if [ -n "$SITE_PLUGIN" ] && ! [[ "$SITE_PLUGIN" =~ ^[a-z0-9-]+$ ]]; then
+            echo "::error::Invalid site_plugin \"$SITE_PLUGIN\" in $MANIFEST; slugs must match [a-z0-9-]."
+            exit 1
+          fi
+
+          # Every variable the reconciler reads from its environment: `${VAR}`
+          # references (it interpolates every string in the file, `_comment`
+          # included, with this same pattern) and `token_env` values.
+          ENV_NAMES=$(jq -c '
+            [ ( .. | strings | scan("\\$\\{([A-Z_][A-Z0-9_]*)\\}") | .[0] ),
+              ( .. | objects | .token_env? | strings ) ]
+            | unique
+          ' "$MANIFEST")
+          while read -r NAME; do
+            [ -z "$NAME" ] && continue
+            if ! [[ "$NAME" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+              echo "::error::Invalid token_env \"$NAME\" in $MANIFEST; it must match [A-Z_][A-Z0-9_]*."
+              exit 1
+            fi
+          done < <(jq -r '.[]' <<< "$ENV_NAMES")
+
+          {
+            echo "code=$CODE"
+            echo "site-plugin=$SITE_PLUGIN"
+            echo "env-names=$ENV_NAMES"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Deploy plan ($TARGET_ENV)"
+            echo
+            echo "| Type | Slug |"
+            echo "| --- | --- |"
+            jq -r '.[] | "| \(.type) | `\(.slug)` |"' <<< "$CODE"
+            echo
+            echo "Site plugin: \`${SITE_PLUGIN:-none}\`"
+            echo
+            echo "Secrets forwarded to the reconciler: $(jq -r 'if length == 0 then "none" else map("`\(.)`") | join(", ") end' <<< "$ENV_NAMES")"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-code:
+    name: Deploy ${{ matrix.type }} ${{ matrix.slug }} to ${{ inputs.target-env }}
+    needs: [ 'plan' ]
+    if: ${{ needs.plan.outputs.code != '[]' }}
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.code) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load SSH key
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Add host to known hosts
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy via rsync
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PATH: ${{ matrix.type == 'plugin' && secrets.DEPLOY_PLUGIN_PATH || secrets.DEPLOY_THEME_PATH }}
+          DISTIGNORE: ${{ inputs.distignore }}
+          TYPE: ${{ matrix.type }}
+          SLUG: ${{ matrix.slug }}
+        run: |
+          EXCLUDE=()
+          if [ -f "$DISTIGNORE" ]; then
+            EXCLUDE=(--exclude-from="$DISTIGNORE")
+          fi
+          rsync -az --delete \
+            "${EXCLUDE[@]}" \
+            "wp-content/${TYPE}s/$SLUG/" "$DEPLOY_USER"@"$DEPLOY_HOST":"$DEPLOY_PATH"/"$SLUG"/
+
+  reconcile-apply:
+    name: Apply reconcile on ${{ inputs.target-env }}
+    needs: [ 'plan', 'deploy-code' ]
+    # `deploy-code` is skipped when the manifest has no monorepo entries; the
+    # reconcile still has to run then, but never after a failed code deploy.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.deploy-code.result) }}
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load SSH key
+        uses: webfactory/ssh-agent@e83874834305fe9a4a2997156cb26c5de65a8555 # v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Add host to known hosts
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Sync manifest
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_MANIFEST_PATH: ${{ secrets.DEPLOY_MANIFEST_PATH }}
+          MANIFEST: ${{ inputs.manifest }}
+        run: |
+          rsync -az "$MANIFEST" "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_MANIFEST_PATH"
+
+      # The reconciler is provided by the structured-deployments plugin, so it
+      # has to be on the server at the version the manifest pins before the
+      # reconcile step can run. Install it here whenever it is missing or at a
+      # different version, reading the tag from the manifest so the pin has a
+      # single source of truth. The reconciler then sees a matching version and
+      # leaves it alone; it never has to replace its own files mid-run.
+      - name: Install the pinned structured-deployments plugin
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_WP_PATH: ${{ secrets.DEPLOY_WP_PATH }}
+          MANIFEST: ${{ inputs.manifest }}
+          TARGET_ENV: ${{ inputs.target-env }}
+          GH_TOKEN: ${{ secrets.STRUCTURED_DEPLOYMENTS_GITHUB_TOKEN }}
+        run: |
+          ENTRY='structured-deployments'
+          ENTRY_JSON=$(jq -c --arg env "$TARGET_ENV" --arg slug "$ENTRY" '((.shared.plugins // {}) + (.[$env].plugins // {}))[$slug]' "$MANIFEST")
+          REPO=$(jq -r 'if type == "object" then .repo // empty else empty end' <<< "$ENTRY_JSON")
+          TAG=$(jq -r 'if type == "object" then .tag // empty else empty end' <<< "$ENTRY_JSON")
+          if [ -z "$TAG" ] || [ -z "$REPO" ]; then
+            echo "::error::$MANIFEST must pin $ENTRY with a github-release repo and tag."
+            exit 1
+          fi
+          WP_PATH_Q=$(printf '%q' "$DEPLOY_WP_PATH")
+
+          # shellcheck disable=SC2029
+          INSTALLED=$(ssh "$DEPLOY_USER@$DEPLOY_HOST" "wp plugin get $ENTRY --field=version --path=$WP_PATH_Q 2>/dev/null" || true)
+          if [ "${INSTALLED#v}" = "${TAG#v}" ]; then
+            echo "$ENTRY $INSTALLED is already installed."
+            exit 0
+          fi
+          echo "Installing $ENTRY $TAG (installed: ${INSTALLED:-none})."
+
+          DOWNLOAD_DIR=$(mktemp -d)
+          gh release download "$TAG" --repo "$REPO" --pattern "$ENTRY.zip" --dir "$DOWNLOAD_DIR"
+          # Stage the zip in ~/backup-tmp/ rather than /tmp. On a shared hosting
+          # account /tmp is often small and not ours to manage, so files are
+          # staged under the SSH user's home directory instead.
+          REMOTE_ZIP_NAME="$ENTRY-$GITHUB_RUN_ID.zip"
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p ~/backup-tmp"
+          rsync -az "$DOWNLOAD_DIR/$ENTRY.zip" "$DEPLOY_USER@$DEPLOY_HOST:~/backup-tmp/$REMOTE_ZIP_NAME"
+          # shellcheck disable=SC2029
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+            "wp plugin install ~/backup-tmp/$REMOTE_ZIP_NAME --force --path=$WP_PATH_Q; STATUS=\$?; rm -f ~/backup-tmp/$REMOTE_ZIP_NAME; exit \$STATUS"
+
+      - name: Bootstrap-activate structured-deployments and the site plugin
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_WP_PATH: ${{ secrets.DEPLOY_WP_PATH }}
+          SITE_PLUGIN: ${{ needs.plan.outputs.site-plugin }}
+        run: |
+          WP_PATH_Q=$(printf '%q' "$DEPLOY_WP_PATH")
+          # shellcheck disable=SC2029
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+            "wp plugin activate structured-deployments $SITE_PLUGIN --network --path=$WP_PATH_Q"
+
+      - name: Run reconciler (apply)
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_WP_PATH: ${{ secrets.DEPLOY_WP_PATH }}
+          DEPLOY_MANIFEST_PATH: ${{ secrets.DEPLOY_MANIFEST_PATH }}
+          TARGET_ENV: ${{ inputs.target-env }}
+          DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+          ENV_NAMES: ${{ needs.plan.outputs.env-names }}
+          # The variables the manifest needs are only known at run time, so the
+          # whole secrets context is handed to this step and filtered down to
+          # exactly the names the plan job read from the manifest. Every value
+          # stays masked in the log.
+          SECRETS_JSON: ${{ toJSON(secrets) }} # zizmor: ignore[overprovisioned-secrets]
+        run: |
+          FORWARD=()
+          MISSING=()
+          while read -r NAME; do
+            [ -z "$NAME" ] && continue
+            if ! jq -e --arg name "$NAME" 'has($name)' <<< "$SECRETS_JSON" > /dev/null; then
+              MISSING+=("$NAME")
+              continue
+            fi
+            VALUE=$(jq -r --arg name "$NAME" '.[$name]' <<< "$SECRETS_JSON")
+            FORWARD+=("$NAME=$(printf '%q' "$VALUE")")
+          done < <(jq -r '.[]' <<< "$ENV_NAMES")
+          unset SECRETS_JSON
+          if [ "${#MISSING[@]}" -gt 0 ]; then
+            # The manifest parser interpolates the whole file before it picks
+            # the target env's section, so a variable referenced only by
+            # another env still fails this one. Stop here with a clearer
+            # message than the reconciler's.
+            echo "::error::The manifest references these variables, but the $DEPLOY_ENVIRONMENT environment has no secret for them: ${MISSING[*]}"
+            exit 1
+          fi
+
+          TARGET_ENV_Q=$(printf '%q' "$TARGET_ENV")
+          MANIFEST_Q=$(printf '%q' "$DEPLOY_MANIFEST_PATH")
+          WP_PATH_Q=$(printf '%q' "$DEPLOY_WP_PATH")
+          OUTPUT_FILE=$(mktemp)
+          # Stream to the live job log via `tee` (rather than capturing into a
+          # variable) so reconcile progress is visible as it happens, while
+          # still saving a copy to fold into the step summary below. Disable
+          # errexit around the pipeline so a failing ssh doesn't abort the
+          # script before the summary is written; PIPESTATUS[0] recovers ssh's
+          # real exit code (tee itself doesn't fail here).
+          set +e
+          # shellcheck disable=SC2029
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+            "env ${FORWARD[*]} wp structured-deployments reconcile --env=$TARGET_ENV_Q --manifest=$MANIFEST_Q --path=$WP_PATH_Q --yes --timings" \
+            | tee "$OUTPUT_FILE"
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          {
+            echo "## Reconcile log ($TARGET_ENV)"
+            echo
+            echo '```'
+            cat "$OUTPUT_FILE"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$STATUS"
